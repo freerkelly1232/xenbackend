@@ -1,6 +1,6 @@
 """
-Xen Notifier Backend - 100% Python 3.13 Compatible
-FastAPI + MongoDB + Discord OAuth + LTC Payments
+Xen Notifier Backend - COMPLETE with Admin Panel Support
+100% Python 3.13 Compatible
 """
 
 import os
@@ -36,15 +36,16 @@ NOWPAYMENTS_API_KEY = os.getenv("NOWPAYMENTS_API_KEY", "")
 NOWPAYMENTS_IPN_SECRET = os.getenv("NOWPAYMENTS_IPN_SECRET", "")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "https://xenjoiner.com")
 SESSION_SECRET = os.getenv("SESSION_SECRET", "change-me-in-production")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")  # Change this!
 PORT = int(os.getenv("PORT", 8080))
 
 # Global database connection
 db = None
 
 # FastAPI App
-app = FastAPI(title="Xen Notifier API", version="2.0.6")
+app = FastAPI(title="Xen Notifier API", version="2.0.7")
 
-# CORS Configuration
+# CORS Configuration - ALLOW YOUR FRONTEND
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -54,6 +55,7 @@ app.add_middleware(
         "http://www.xenjoiner.com",
         "http://localhost:5173",
         "http://localhost:3000",
+        "*"  # TEMPORARY - Remove in production!
     ],
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
@@ -84,6 +86,13 @@ class IPNCallback(BaseModel):
     
     class Config:
         extra = "allow"
+
+class AdminLoginRequest(BaseModel):
+    password: str
+
+class AddBalanceRequest(BaseModel):
+    discord_id: str
+    amount: float
 
 # Helper Functions
 def format_est_time(dt: datetime) -> str:
@@ -137,6 +146,11 @@ async def get_current_user(authorization: str = Header(None)):
     
     return user
 
+async def verify_admin(admin_key: str = Header(None, alias="admin-key")):
+    """Verify admin key"""
+    if not admin_key or admin_key != SESSION_SECRET:
+        raise HTTPException(status_code=401, detail="Invalid admin key")
+
 # Startup & Background Tasks
 @app.on_event("startup")
 async def startup():
@@ -145,7 +159,6 @@ async def startup():
     
     if not MONGODB_URI:
         print("⚠️ WARNING: MONGODB_URI not set!")
-        print("⚠️ Set MONGODB_URI environment variable in Railway!")
         raise RuntimeError("MONGODB_URI environment variable is required")
     
     # Connect to MongoDB
@@ -158,6 +171,8 @@ async def startup():
     await db.transactions.create_index([("discord_id", 1), ("date", -1)])
     
     print("✅ Database initialized")
+    print(f"✅ Admin password: {ADMIN_PASSWORD}")
+    print(f"✅ Frontend URL: {FRONTEND_URL}")
     
     # Start background cleanup task
     asyncio.create_task(cleanup_expired_subscriptions())
@@ -212,16 +227,20 @@ async def get_slots():
             "plan": "deluxe",
             "subscription_active": True
         })
+        premium_count = await db.users.count_documents({
+            "plan": "premium",
+            "subscription_active": True
+        })
         
         return JSONResponse(
             content={
                 "deluxe": {"used": deluxe_count, "total": 6},
-                "premium": {"used": 0, "total": 0}
+                "premium": {"used": premium_count, "total": 7}
             },
             headers={"Cache-Control": "no-cache, no-store, must-revalidate"}
         )
     except Exception as e:
-        return {"deluxe": {"used": 0, "total": 6}, "premium": {"used": 0, "total": 0}}
+        return {"deluxe": {"used": 0, "total": 6}, "premium": {"used": 0, "total": 7}}
 
 # Discord OAuth
 @app.get("/auth/discord")
@@ -281,14 +300,12 @@ async def discord_callback(code: str, req: Request):
         existing_user = await db.users.find_one({"discord_id": discord_id})
         
         if existing_user:
-            # Update existing user
             await db.users.update_one(
                 {"discord_id": discord_id},
                 {"$set": {"username": username, "email": email}}
             )
             user = await db.users.find_one({"discord_id": discord_id})
         else:
-            # Create new user
             new_user = {
                 "discord_id": discord_id,
                 "username": username,
@@ -324,7 +341,6 @@ async def get_user_info(user: dict = Depends(get_current_user)):
         subscription_expiry_est = None
         time_left = 0
         
-        # Calculate expiry and time left
         if user.get("subscription_expiry"):
             try:
                 expiry_dt = _parse_dt(user["subscription_expiry"])
@@ -335,7 +351,6 @@ async def get_user_info(user: dict = Depends(get_current_user)):
             except Exception as e:
                 print(f"Error parsing expiry: {e}")
         
-        # Get transactions
         transactions = []
         try:
             transactions = await db.transactions.find(
@@ -444,23 +459,21 @@ async def purchase_subscription(request: PurchaseRequest, user: dict = Depends(g
     plan = request.plan.lower()
     hours = request.hours
     
-    # Validate
-    if plan not in ["deluxe"]:
+    if plan not in ["deluxe", "premium"]:
         raise HTTPException(status_code=400, detail="Invalid plan")
     if hours < 4:
         raise HTTPException(status_code=400, detail="Minimum 4 hours required")
     
-    # Calculate cost
-    hourly_rate = 6.0  # $6/hour for Deluxe
+    # Pricing
+    hourly_rate = 6.0 if plan == "deluxe" else 3.0
     cost = hours * hourly_rate
     
-    # Check balance
     if user["balance"] < cost:
         raise HTTPException(status_code=400, detail=f"Insufficient balance. Required: ${cost}, Available: ${user['balance']}")
     
-    # Check slots (unless extending)
-    slots = await db.users.count_documents({"plan": "deluxe", "subscription_active": True})
-    max_slots = 6
+    # Check slots
+    slots = await db.users.count_documents({"plan": plan, "subscription_active": True})
+    max_slots = 6 if plan == "deluxe" else 7
     
     is_extending = user.get("subscription_active") and user.get("subscription_key")
     
@@ -472,7 +485,6 @@ async def purchase_subscription(request: PurchaseRequest, user: dict = Depends(g
     try:
         # Calculate new expiry
         if is_extending:
-            # Extending existing subscription
             current_expiry = _parse_dt(user["subscription_expiry"])
             if current_expiry > datetime.utcnow():
                 new_expiry = current_expiry + timedelta(hours=hours)
@@ -481,10 +493,8 @@ async def purchase_subscription(request: PurchaseRequest, user: dict = Depends(g
             key = user["subscription_key"]
             print(f"🔄 Extending existing key: {key}")
         else:
-            # New subscription
             new_expiry = datetime.utcnow() + timedelta(hours=hours)
             
-            # Check for expired key to reuse
             existing_sub = await db.subscriptions.find_one({
                 "discord_id": user["discord_id"],
                 "expiry": {"$lt": datetime.utcnow()}
@@ -509,7 +519,7 @@ async def purchase_subscription(request: PurchaseRequest, user: dict = Depends(g
                     "identifier": user["discord_id"],
                     "identifier_type": "discord",
                     "discord_id": user["discord_id"],
-                    "note": "Deluxe",
+                    "note": plan.capitalize(),
                     "expire": int(new_expiry.timestamp())
                 },
                 timeout=30.0
@@ -524,7 +534,7 @@ async def purchase_subscription(request: PurchaseRequest, user: dict = Depends(g
             if not key:
                 key = lua_data.get("user_key")
         
-        # Deduct balance atomically
+        # Deduct balance
         result = await db.users.update_one(
             {
                 "discord_id": user["discord_id"],
@@ -536,7 +546,7 @@ async def purchase_subscription(request: PurchaseRequest, user: dict = Depends(g
                     "subscription_active": True,
                     "subscription_key": key,
                     "subscription_expiry": new_expiry,
-                    "plan": "deluxe"
+                    "plan": plan
                 }
             }
         )
@@ -552,8 +562,8 @@ async def purchase_subscription(request: PurchaseRequest, user: dict = Depends(g
                     "key": key,
                     "discord_id": user["discord_id"],
                     "username": user["username"],
-                    "plan": "deluxe",
-                    "note": "Deluxe",
+                    "plan": plan,
+                    "note": plan.capitalize(),
                     "expiry": new_expiry,
                     "updated_at": datetime.utcnow(),
                     "purchase_time": datetime.utcnow()
@@ -568,18 +578,19 @@ async def purchase_subscription(request: PurchaseRequest, user: dict = Depends(g
         # Create transaction
         await db.transactions.insert_one({
             "discord_id": user["discord_id"],
-            "type": f"Purchase Deluxe ({hours}h)",
+            "type": f"Purchase {plan.capitalize()} ({hours}h)",
             "amount": -cost,
             "status": "completed",
             "date": datetime.utcnow()
         })
         
-        # Auto-assign Discord role (best-effort, don't fail if it errors)
+        # Auto-assign Discord role
         try:
-            if DISCORD_BOT_TOKEN and DISCORD_GUILD_ID and DISCORD_ROLE_ID_DELUXE:
+            role_id = DISCORD_ROLE_ID_DELUXE if plan == "deluxe" else DISCORD_ROLE_ID_PREMIUM
+            if DISCORD_BOT_TOKEN and DISCORD_GUILD_ID and role_id:
                 async with httpx.AsyncClient() as client:
                     await client.put(
-                        f"https://discord.com/api/guilds/{DISCORD_GUILD_ID}/members/{user['discord_id']}/roles/{DISCORD_ROLE_ID_DELUXE}",
+                        f"https://discord.com/api/guilds/{DISCORD_GUILD_ID}/members/{user['discord_id']}/roles/{role_id}",
                         headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}"}
                     )
                 print(f"✅ Auto-assigned Discord role")
@@ -592,8 +603,8 @@ async def purchase_subscription(request: PurchaseRequest, user: dict = Depends(g
             content={
                 "success": True,
                 "key": key,
-                "plan": "deluxe",
-                "note": "Deluxe",
+                "plan": plan,
+                "note": plan.capitalize(),
                 "expiry": format_est_time(new_expiry),
                 "message": f"Key active for {hours}h! Expiry: {format_est_time(new_expiry)}"
             },
@@ -698,13 +709,10 @@ async def payment_callback(
     print(f"Payment ID: {callback.payment_id}")
     print(f"Status: {callback.payment_status}")
     print(f"Order ID: {callback.order_id}")
-    print(f"Price Amount: {callback.price_amount}")
-    print(f"Actually Paid: {callback.actually_paid}")
     print(f"Outcome Amount: {callback.outcome_amount}")
-    print(f"Full callback: {callback.dict()}")
     print("=" * 80)
     
-    # Verify signature (log warning but don't fail)
+    # Verify signature
     if NOWPAYMENTS_IPN_SECRET and x_nowpayments_sig:
         payload_dict = callback.dict()
         sorted_params = sorted(payload_dict.items())
@@ -717,14 +725,12 @@ async def payment_callback(
         ).hexdigest()
         
         if not hmac.compare_digest(x_nowpayments_sig, expected_sig):
-            print(f"⚠️ WARNING: Invalid signature - continuing anyway for debug")
+            print(f"⚠️ WARNING: Invalid signature")
     
-    # Only process specific statuses
     if callback.payment_status not in ["finished", "partially_paid", "confirmed", "sending"]:
         print(f"⚠️ Ignoring status: {callback.payment_status}")
         return {"status": "ignored", "reason": f"Status '{callback.payment_status}' not processed"}
     
-    # Parse order ID
     parts = callback.order_id.split("_")
     if len(parts) != 2:
         print(f"❌ Invalid order_id format: {callback.order_id}")
@@ -732,7 +738,6 @@ async def payment_callback(
     
     discord_id = parts[0]
     
-    # Check if already processed
     existing_txn = await db.transactions.find_one({
         "payment_id": str(callback.payment_id),
         "status": "completed"
@@ -742,22 +747,17 @@ async def payment_callback(
         print(f"⚠️ Payment {callback.payment_id} already processed")
         return {"status": "already_processed"}
     
-    # Determine credit amount (priority: outcome_amount → actually_paid → price_amount)
     credit_amount = 0
     if callback.outcome_amount and callback.outcome_amount > 0:
         credit_amount = callback.outcome_amount
-        print(f"Using outcome_amount: ${credit_amount}")
     elif callback.actually_paid and callback.actually_paid > 0:
         credit_amount = callback.actually_paid
-        print(f"Using actually_paid: ${credit_amount}")
     elif callback.price_amount and callback.price_amount > 0:
         credit_amount = callback.price_amount
-        print(f"Using price_amount: ${credit_amount}")
     else:
         print(f"❌ No valid credit amount found!")
         return {"status": "error", "reason": "No valid credit amount"}
     
-    # Credit balance
     print(f"💰 Crediting ${credit_amount} to user {discord_id}")
     result = await db.users.update_one(
         {"discord_id": discord_id},
@@ -773,7 +773,6 @@ async def payment_callback(
             "subscription_active": False,
         })
     
-    # Update transaction
     await db.transactions.update_one(
         {"payment_id": str(callback.payment_id)},
         {
@@ -786,13 +785,10 @@ async def payment_callback(
         }
     )
     
-    # Get final balance
     user = await db.users.find_one({"discord_id": discord_id})
     new_balance = user.get("balance", 0) if user else credit_amount
     
-    print(f"✅ SUCCESS: Payment processed!")
-    print(f"   Credited: ${credit_amount}")
-    print(f"   New Balance: ${new_balance}")
+    print(f"✅ SUCCESS: Payment processed! New balance: ${new_balance}")
     print("=" * 80)
     
     return {
@@ -811,7 +807,6 @@ async def assign_discord_role(user: dict = Depends(get_current_user)):
     if not DISCORD_GUILD_ID:
         raise HTTPException(status_code=500, detail="Discord guild not configured")
     
-    # Get plan
     plan = user.get("plan")
     if not user.get("subscription_active") or not plan:
         raise HTTPException(status_code=400, detail="No active subscription")
@@ -870,11 +865,54 @@ async def assign_discord_role(user: dict = Depends(get_current_user)):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
-# Admin Endpoints
-async def verify_admin(admin_key: str = Header(None, alias="admin-key")):
-    """Verify admin key"""
-    if not admin_key or admin_key != SESSION_SECRET:
-        raise HTTPException(status_code=401, detail="Invalid admin key")
+# ADMIN ENDPOINTS
+@app.post("/admin/login")
+async def admin_login(request: AdminLoginRequest):
+    """Admin login endpoint"""
+    if request.password != ADMIN_PASSWORD:
+        raise HTTPException(status_code=401, detail="Invalid password")
+    
+    # Create admin token
+    admin_token = create_access_token({"admin": True, "password": request.password})
+    
+    return {"token": admin_token}
+
+@app.post("/admin/add-balance")
+async def admin_add_balance(request: AddBalanceRequest, admin: None = Depends(verify_admin)):
+    """Add balance to user (admin only)"""
+    
+    if not request.discord_id or request.amount <= 0:
+        raise HTTPException(status_code=400, detail="Invalid input")
+    
+    print(f"👑 Admin adding ${request.amount} to {request.discord_id}")
+    
+    result = await db.users.update_one(
+        {"discord_id": request.discord_id},
+        {"$inc": {"balance": request.amount}}
+    )
+    
+    if result.matched_count == 0:
+        # Create user if doesn't exist
+        await db.users.insert_one({
+            "discord_id": request.discord_id,
+            "balance": request.amount,
+            "created_at": datetime.utcnow(),
+            "subscription_active": False,
+        })
+    
+    # Create transaction
+    await db.transactions.insert_one({
+        "discord_id": request.discord_id,
+        "type": "Admin Credit",
+        "amount": request.amount,
+        "status": "completed",
+        "date": datetime.utcnow()
+    })
+    
+    user = await db.users.find_one({"discord_id": request.discord_id})
+    new_balance = user.get("balance", 0) if user else request.amount
+    
+    return {"success": True, "new_balance": new_balance}
 
 @app.get("/admin/subscribers")
 async def get_subscribers(admin: None = Depends(verify_admin)):
@@ -906,7 +944,7 @@ async def get_subscribers(admin: None = Depends(verify_admin)):
                     "id": lua_user.get("id"),
                     "discord_id": lua_user.get("discord_id"),
                     "username": lua_user.get("note") or "Unknown",
-                    "plan": "deluxe",
+                    "plan": lua_user.get("note", "").lower() if lua_user.get("note") else "unknown",
                     "note": lua_user.get("note"),
                     "key": lua_user.get("user_key"),
                     "expiry": expiry_str,
