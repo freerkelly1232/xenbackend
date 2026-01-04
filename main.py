@@ -226,20 +226,19 @@ async def get_user_info(user: dict = Depends(get_user)):
         if isinstance(t.get("date"), datetime):
             t["date"] = format_est_time(t["date"])
     
+    # Return flat structure that frontend expects
     return {
-        "user": {
-            "discord_id": user["discord_id"],
-            "username": user.get("username", "Unknown"),
-            "email": user.get("email", ""),
-            "balance": float(user.get("balance", 0)),
-            "subscription_active": bool(user.get("subscription_active", False)),
-            "subscription_key": user.get("subscription_key"),
-            "subscription_expiry": expiry_est,
-            "plan": user.get("plan"),
-            "hwid_resets": int(user.get("hwid_resets", 0)),
-        },
+        "discord_id": user["discord_id"],
+        "username": user.get("username", "Unknown"),
+        "email": user.get("email", ""),
+        "balance": float(user.get("balance", 0)),
+        "subscription_active": bool(user.get("subscription_active", False)),
+        "subscription_key": user.get("subscription_key"),
+        "subscription_expiry": expiry_est,
+        "plan": user.get("plan"),
+        "hwid_resets": int(user.get("hwid_resets", 0)),
         "transactions": txns,
-        "time_left": time_left
+        "timeLeft": time_left
     }
 
 @app.post("/subscription/purchase")
