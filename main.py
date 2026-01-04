@@ -1,6 +1,6 @@
 """
-Xen Notifier Backend - Complete Working Version
-FastAPI + MongoDB + Discord OAuth + LTC Payments + Lua Armor
+Xen Notifier Backend - 100% Python 3.13 Compatible
+FastAPI + MongoDB + Discord OAuth + LTC Payments
 """
 
 import os
@@ -10,7 +10,7 @@ import hashlib
 import json
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Optional, List
+from typing import Optional
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -21,9 +21,8 @@ from motor import motor_asyncio
 from pydantic import BaseModel
 import jwt
 
-# ==================== ENVIRONMENT VARIABLES ====================
-
-MONGODB_URI = os.getenv("MONGODB_URI")
+# Environment Variables
+MONGODB_URI = os.getenv("MONGODB_URI", "")
 DISCORD_CLIENT_ID = os.getenv("DISCORD_CLIENT_ID", "")
 DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET", "")
 DISCORD_CALLBACK_URL = os.getenv("DISCORD_CALLBACK_URL", "")
@@ -42,9 +41,8 @@ PORT = int(os.getenv("PORT", 8080))
 # Global database connection
 db = None
 
-# ==================== FASTAPI APP ====================
-
-app = FastAPI(title="Xen Notifier API", version="2.0.5")
+# FastAPI App
+app = FastAPI(title="Xen Notifier API", version="2.0.6")
 
 # CORS Configuration
 app.add_middleware(
@@ -64,14 +62,13 @@ app.add_middleware(
     max_age=3600,
 )
 
-# ==================== PYDANTIC MODELS ====================
-
+# Pydantic Models
 class PurchaseRequest(BaseModel):
-    plan: str  # "deluxe"
-    hours: int  # minimum 4
+    plan: str
+    hours: int
 
 class TopUpRequest(BaseModel):
-    amount: float  # minimum 1.0
+    amount: float
     currency: Optional[str] = "ltc"
 
 class IPNCallback(BaseModel):
@@ -88,8 +85,7 @@ class IPNCallback(BaseModel):
     class Config:
         extra = "allow"
 
-# ==================== HELPER FUNCTIONS ====================
-
+# Helper Functions
 def format_est_time(dt: datetime) -> str:
     """Convert UTC datetime to EST string"""
     if dt is None:
@@ -141,12 +137,16 @@ async def get_current_user(authorization: str = Header(None)):
     
     return user
 
-# ==================== STARTUP & BACKGROUND TASKS ====================
-
+# Startup & Background Tasks
 @app.on_event("startup")
 async def startup():
     """Initialize database and background tasks"""
     global db
+    
+    if not MONGODB_URI:
+        print("⚠️ WARNING: MONGODB_URI not set!")
+        print("⚠️ Set MONGODB_URI environment variable in Railway!")
+        raise RuntimeError("MONGODB_URI environment variable is required")
     
     # Connect to MongoDB
     client = motor_asyncio.AsyncIOMotorClient(MONGODB_URI)
@@ -184,8 +184,7 @@ async def cleanup_expired_subscriptions():
         except Exception as e:
             print(f"❌ Cleanup error: {e}")
 
-# ==================== PUBLIC ENDPOINTS ====================
-
+# Public Endpoints
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
@@ -196,6 +195,7 @@ async def health_check():
         return JSONResponse(
             content={
                 "status": "ok",
+                "python_version": "3.13",
                 "users": user_count,
                 "active_subscriptions": active_subs
             },
@@ -223,8 +223,7 @@ async def get_slots():
     except Exception as e:
         return {"deluxe": {"used": 0, "total": 6}, "premium": {"used": 0, "total": 0}}
 
-# ==================== DISCORD OAUTH ====================
-
+# Discord OAuth
 @app.get("/auth/discord")
 async def discord_oauth():
     """Redirect to Discord OAuth"""
@@ -317,8 +316,7 @@ async def discord_callback(code: str, req: Request):
         traceback.print_exc()
         return RedirectResponse(f"{FRONTEND_URL}/login?error=server_error")
 
-# ==================== AUTHENTICATED ENDPOINTS ====================
-
+# Authenticated Endpoints
 @app.get("/user")
 async def get_user_info(user: dict = Depends(get_current_user)):
     """Get current user info with dashboard data"""
@@ -438,8 +436,7 @@ async def reset_hwid(user: dict = Depends(get_current_user)):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"HWID reset failed: {str(e)}")
 
-# ==================== SUBSCRIPTION MANAGEMENT ====================
-
+# Subscription Management
 @app.post("/subscription/purchase")
 async def purchase_subscription(request: PurchaseRequest, user: dict = Depends(get_current_user)):
     """Purchase or extend subscription"""
@@ -611,8 +608,7 @@ async def purchase_subscription(request: PurchaseRequest, user: dict = Depends(g
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
-# ==================== PAYMENT SYSTEM ====================
-
+# Payment System
 @app.post("/payment/create")
 async def create_payment(request: TopUpRequest, user: dict = Depends(get_current_user)):
     """Create LTC payment via NOWPayments"""
@@ -805,8 +801,7 @@ async def payment_callback(
         "new_balance": new_balance
     }
 
-# ==================== DISCORD ROLE ASSIGNMENT ====================
-
+# Discord Role Assignment
 @app.post("/discord/assign-role")
 async def assign_discord_role(user: dict = Depends(get_current_user)):
     """Assign Discord role based on subscription plan"""
@@ -875,8 +870,7 @@ async def assign_discord_role(user: dict = Depends(get_current_user)):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
-# ==================== ADMIN ENDPOINTS ====================
-
+# Admin Endpoints
 async def verify_admin(admin_key: str = Header(None, alias="admin-key")):
     """Verify admin key"""
     if not admin_key or admin_key != SESSION_SECRET:
@@ -927,8 +921,7 @@ async def get_subscribers(admin: None = Depends(verify_admin)):
         print(f"❌ Subscribers fetch error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# ==================== RUN SERVER ====================
-
+# Run Server
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=PORT)
